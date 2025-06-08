@@ -567,22 +567,19 @@ y=0.00118+ 0.99489/(3.7941*sqrt(pi/(4*ln(2)))) * exp(-4*ln(2)*(x-0.03421)^2/3.79
 #     sgax = (x * alpha).sigmoid_simulation_()
 #     return grad_output * (1. - sgax) * sgax * alpha, None
 
-def sigmoid_simulation_backward(grad_output: torch.Tensor, x: torch.Tensor, alpha: float):
+def sigmoid_simulation_backward(grad_output: torch.Tensor, x_scaled: torch.Tensor, alpha: float):
+    pi = torch.tensor(math.pi, dtype=x_scaled.dtype, device=x_scaled.device)
+    log2 = torch.log(torch.tensor(2.0, dtype=x_scaled.dtype, device=x_scaled.device))
+    c = 3.7941
     a = 0.00118
     b = 0.99489
-    c = 3.7941
     x0 = 0.03421
-    eps = 1e-7  # 防止除零
-    # 计算导数项
-    denominator = c * torch.sqrt(torch.tensor(torch.pi / (4 * torch.log(torch.tensor(2.0))))) + eps
-    exponent_derivative = -8 * torch.log(torch.tensor(2.0)) * (x - x0) / (c ** 2 + eps)
-
-    # 真实梯度公式
-    grad_x = grad_output * (b / denominator) * torch.exp(
-        -4 * torch.log(torch.tensor(2.0)) * (x - x0) ** 2 / (c ** 2 + eps)) * exponent_derivative
-
-    return grad_x, None
-
+    scale = b / (c * torch.sqrt(pi / (4 * log2)))
+    exponent = -4 * log2 * (x_scaled - x0) ** 2 / (c ** 2)
+    grad_x = a + scale * torch.exp(exponent)
+    grad_x = grad_output * grad_x * alpha
+    grad_x = torch.clamp(grad_x, -50.0, 50.0)
+    return grad_x, None 
 
 class sigmoid_simulation_function(torch.autograd.Function):
     @staticmethod
@@ -604,38 +601,54 @@ class Sigmoid_Simulation(SurrogateFunctionBase):
     @staticmethod
     def spiking_function(x, alpha):
         return sigmoid_simulation_function.apply(x, alpha)
-
+    
+    @staticmethod
+    def primitive_function(x: torch.Tensor, alpha: float):
+        return (x * alpha).sigmoid()
+    
     @staticmethod
     def backward(grad_output, x, alpha):
         return sigmoid_simulation_backward(grad_output, x, alpha)[0]
 
-    def cuda_code(self, x: str, y: str, dtype='fp32'):
-        sg_name = 'sg_' + self._get_name()
-        alpha = str(self.alpha) + 'f'
-        code = f'''
-            {tab4_str}{self.cuda_code_start_comments()}
-        '''
-
-        if dtype == 'fp32':
-            code += f'''
-            {tab4_str}const float {sg_name}_sigmoid_ax = 1.0f / (1.0f + expf(- {alpha} * {x}));
-            {tab4_str}const float {y} = (1.0f - {sg_name}_sigmoid_ax) * {sg_name}_sigmoid_ax * {alpha};
-            '''
-        elif dtype == 'fp16':
-            code += f'''
-            {tab4_str}const half2 {sg_name}_alpha = __float2half2_rn({alpha});
-            {tab4_str}const half2 {sg_name}_sigmoid_ax = __h2div(__float2half2_rn(1.0f), __hadd2(h2exp(__hneg2(__hmul2({sg_name}_alpha, {x}))), __float2half2_rn(1.0f)));
-            {tab4_str}const half2 {y } = __hmul2(__hmul2(__hsub2(__float2half2_rn(1.0f), {sg_name}_sigmoid_ax), {sg_name}_sigmoid_ax), {sg_name}_alpha);
-            '''
-        else:
-            raise NotImplementedError
-        code += f'''
-            {tab4_str}{self.cuda_code_end_comments()}
-        '''
-        return code
-
-    def cuda_codes(self, y: str, x: str, dtype: str):
-        return cfunction.sigmoid_simulation_backward(y=y, x=x, alpha=self.alpha, dtype=dtype)
+    # def cuda_code(self, x: str, y: str, dtype='fp32'):
+    #     a_val = 0.00118
+    #     b_val = 0.99489
+    #     c_val = 3.7941
+    #     x0_val = 0.03421
+    #     alpha = self.alpha
+        
+    #     code = f"""
+    #     // {self.cuda_code_start_comments()}
+    #     """
+        
+    #     if dtype == 'fp32':
+    #         code += f"""
+    #         const float a = {a_val}f;
+    #         const float b = {b_val}f;
+    #         const float c = {c_val}f;
+    #         const float x0 = {x0_val}f;
+    #         const float alpha = {alpha}f;
+            
+    #         // 计算指数部分
+    #         float exponent = -4.0f * logf(2.0f) * powf(({x} * alpha - x0), 2) / (c * c);
+    #         float exp_term = expf(exponent);
+            
+    #         // 计算缩放因子
+    #         float scale = b / (c * sqrtf(M_PI / (4.0f * logf(2.0f))));
+            
+    #         // 梯度计算
+    #         {y} = scale * exp_term * (-8.0f * logf(2.0f) * ({x} * alpha - x0) / (c * c)) * alpha;
+    #         """
+    #     elif dtype == 'fp16':
+    #         # 类似fp32，使用半精度函数（需处理向量化）
+    #         pass
+    #     else:
+    #         raise NotImplementedError
+        
+    #     code += f"""
+    #     // {self.cuda_code_end_comments()}
+    #     """
+    #     return code
 
 
 '''
@@ -654,32 +667,21 @@ y = 0.28 * (1 / (1 + exp(-(x + 0.35876 + 4.57243 / 2) / 1.12176))) * (1 - 1 / (1
 '''
 
 
-def bbl_backward(grad_output: torch.Tensor, x: torch.Tensor, alpha: float):
-    # 定义常量参数
-    a1 = 0.35876
-    a2 = 4.57243 / 2
+def bbl_backward(grad_output: torch.Tensor, x_scaled: torch.Tensor, alpha: float):
+    c1 = 0.35876
+    c2 = 4.57243 / 2
     b1 = 1.12176
     b2 = 0.5924
     scale = 0.28
-    # 注意：原示例中的alpha参数可能未被使用，但保留在函数定义中
-    # 计算第一个sigmoid函数部分
-    sig1_input = (x + a1 + a2) / b1
-    sig1 = 1 / (1 + torch.exp(-sig1_input))
-    sig1_derivative = sig1 * (1 - sig1) / b1  # 应用sigmoid导数公式
-    # 计算第二个sigmoid函数部分
-    sig2_input = (x + a1 - a2) / b2
-    sig2 = 1 / (1 + torch.exp(-sig2_input))
-    sig2_derivative = sig2 * (1 - sig2) / b2
-    # 计算组合导数项
-    term1 = sig1_derivative * (1 - sig2)
-    term2 = - sig1 * sig2_derivative  # 因为第二个项是(1 - sig2)，导数为-sig2_derivative
-    # 组合梯度
-    grad_x = scale * (term1 + term2)
-    # 乘以上游梯度
-    grad_x = grad_output * grad_x
-
-    return grad_x, None
-
+    # 保证常量与x_scaled同设备、同类型
+    x1 = (x_scaled + c1 + c2) / b1
+    x2 = (x_scaled + c1 - c2) / b2
+    sig1 = 1 / (1 + torch.exp(-x1))
+    sig2 = 1 / (1 + torch.exp(-x2))
+    grad = scale * sig1 * (1 - sig2)
+    grad = grad * grad_output * alpha
+    grad = torch.clamp(grad, -50.0, 50.0)
+    return grad, None 
 
 class bbl_function(torch.autograd.Function):
     @staticmethod
@@ -706,36 +708,63 @@ class bbl_Simulation(SurrogateFunctionBase):
         return bbl_function.apply(x, alpha)
 
     @staticmethod
+    def primitive_function(x: torch.Tensor, alpha: float):
+        return (x * alpha).sigmoid()
+
+    @staticmethod
     def backward(grad_output, x, alpha):
         return bbl_backward(grad_output, x, alpha)[0]
 
-    def cuda_code(self, x: str, y: str, dtype='fp32'):
-        sg_name = 'sg_' + self._get_name()
-        alpha = str(self.alpha) + 'f'
-        code = f'''
-            {tab4_str}{self.cuda_code_start_comments()}
-        '''
+    # def cuda_code(self, x: str, y: str, dtype='fp32'):
+    #     # 使用上面修正后的CUDA代码实现
+    #     a1_val = 0.35876
+    #     a2_val = 4.57243 / 2
+    #     b1_val = 1.12176
+    #     b2_val = 0.5924
+    #     scale_val = 0.28
+        
+    #     code = f'''
+    #         {tab4_str}{self.cuda_code_start_comments()}
+    #     '''
+        
+    #     if dtype == 'fp32':
+    #         code += f'''
+    #         {tab4_str}const float a1 = {a1_val}f;
+    #         {tab4_str}const float a2 = {a2_val}f;
+    #         {tab4_str}const float b1 = {b1_val}f;
+    #         {tab4_str}const float b2 = {b2_val}f;
+    #         {tab4_str}const float scale = {scale_val}f;
+    #         {tab4_str}const float alpha = {self.alpha}f;
+            
+    #         {tab4_str}const float x_scaled = {x} * alpha;
+    #         {tab4_str}const float x_val = x_scaled / alpha;
+            
+    #         {tab4_str}const float sig1_input = (x_val + a1 + a2) / b1;
+    #         {tab4_str}const float sig1 = 1.0f / (1.0f + expf(-sig1_input));
+    #         {tab4_str}const float sig1_deriv = sig1 * (1.0f - sig1) / b1;
+            
+    #         {tab4_str}const float sig2_input = (x_val + a1 - a2) / b2;
+    #         {tab4_str}const float sig2 = 1.0f / (1.0f + expf(-sig2_input));
+    #         {tab4_str}const float sig2_deriv = sig2 * (1.0f - sig2) / b2;
+            
+    #         {tab4_str}const float term1 = sig1_deriv * (1.0f - sig2);
+    #         {tab4_str}const float term2 = -sig1 * sig2_deriv;
+    #         {tab4_str}const float {y} = scale * (term1 + term2) * alpha;
+    #         '''
+    #     elif dtype == 'fp16':
+    #         # 半精度实现（略）
+    #         pass
+    #     else:
+    #         raise NotImplementedError
+        
+    #     code += f'''
+    #         {tab4_str}{self.cuda_code_end_comments()}
+    #     '''
+    #     return code
 
-        if dtype == 'fp32':
-            code += f'''
-            {tab4_str}const float {sg_name}_sigmoid_ax = 1.0f / (1.0f + expf(- {alpha} * {x}));
-            {tab4_str}const float {y} = (1.0f - {sg_name}_sigmoid_ax) * {sg_name}_sigmoid_ax * {alpha};
-            '''
-        elif dtype == 'fp16':
-            code += f'''
-            {tab4_str}const half2 {sg_name}_alpha = __float2half2_rn({alpha});
-            {tab4_str}const half2 {sg_name}_sigmoid_ax = __h2div(__float2half2_rn(1.0f), __hadd2(h2exp(__hneg2(__hmul2({sg_name}_alpha, {x}))), __float2half2_rn(1.0f)));
-            {tab4_str}const half2 {y} = __hmul2(__hmul2(__hsub2(__float2half2_rn(1.0f), {sg_name}_sigmoid_ax), {sg_name}_sigmoid_ax), {sg_name}_alpha);
-            '''
-        else:
-            raise NotImplementedError
-        code += f'''
-            {tab4_str}{self.cuda_code_end_comments()}
-        '''
-        return code
-
-    def cuda_codes(self, y: str, x: str, dtype: str):
-        return cfunction.bbl_backward(y=y, x=x, alpha=self.alpha, dtype=dtype)
+    # def cuda_codes(self, y: str, x: str, dtype: str):
+    #     # 实现修正后的CUDA代码
+    #     return self.cuda_code(x, y, dtype)
 
 
 
